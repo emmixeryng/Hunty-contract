@@ -4,8 +4,8 @@
 #![allow(deprecated)]
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, IntoVal, Symbol, Val,
-    Vec,
+    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, IntoVal, Map, Symbol,
+    TryFromVal, Val, Vec,
 };
 
 pub use crate::errors::RewardErrorCode;
@@ -321,19 +321,39 @@ pub struct VestedClaimedEvent {
 
 #[contractimpl]
 impl RewardManager {
-    /// Returns true when HuntyCore reports the hunt as terminal (cancelled or completed).
-    #[allow(dead_code)]
-    fn is_hunt_terminal(env: &Env, hunt_id: u64) -> bool {
-        let core = match Storage::get_hunty_core(env) {
-            Some(c) => c,
-            None => return false,
-        };
+    /// Returns HuntyCore's `HuntStatus` discriminant for `hunt_id` by calling
+    /// `get_hunt_info` and decoding its `status` field generically as a
+    /// `Map<Symbol, Val>`, so reward-manager never needs to depend on
+    /// hunty-core's `Hunt` type directly. Returns `None` if the hunt does not
+    /// exist or the response cannot be decoded.
+    ///
+    /// HuntStatus discriminants (see contracts/hunty-core/src/types.rs):
+    /// Draft=0, Active=1, Completed=2, Cancelled=3, Paused=4,
+    /// EmergencyStopped=5, Archived=6.
+    fn hunt_status(env: &Env, hunty_core: &Address, hunt_id: u64) -> Option<u32> {
         let mut args: Vec<Val> = Vec::new(env);
         args.push_back(hunt_id.into_val(env));
-        let result: Val = env.invoke_contract(&core, &Symbol::new(env, "get_hunt_status"), args);
-        let status: u32 = result.into_val(env);
-        // HuntyCore terminal statuses: Cancelled = 3, Completed = 4.
-        status == 3 || status == 4
+        let hunt_val = match env.try_invoke_contract::<Val, Val>(
+            hunty_core,
+            &Symbol::new(env, "get_hunt_info"),
+            args,
+        ) {
+            Ok(Ok(v)) => v,
+            _ => return None,
+        };
+        let map = Map::<Symbol, Val>::try_from_val(env, &hunt_val).ok()?;
+        let status_val = map.get(Symbol::new(env, "status"))?;
+        u32::try_from_val(env, &status_val).ok()
+    }
+
+    /// Returns true when HuntyCore reports the hunt as terminal: Completed,
+    /// Cancelled, EmergencyStopped, or Archived. Draft, Active, and Paused
+    /// are not terminal — a paused hunt may still resume.
+    fn is_hunt_terminal(env: &Env, hunty_core: &Address, hunt_id: u64) -> bool {
+        matches!(
+            Self::hunt_status(env, hunty_core, hunt_id),
+            Some(2 | 3 | 5 | 6)
+        )
     }
 
     fn is_delegate(config: &RewardPoolConfig, candidate: &Address) -> bool {
@@ -350,8 +370,19 @@ impl RewardManager {
     /// Minimum NftReward version this contract requires.
     pub const REQUIRED_NFT_REWARD_VERSION: u32 = 2;
 
+    /// Constructor - runs atomically during deployment.
+    /// Prevents front-running by initializing during deploy transaction.
+    #[allow(unused_variables)]
+    pub fn __constructor(env: Env, admin: Address, xlm_token: Address, hunty_core: Address) {
+        Storage::set_admin(&env, &admin);
+        Storage::set_xlm_token(&env, &xlm_token);
+        Storage::set_hunty_core(&env, &hunty_core);
+        Storage::set_contract_version(&env, Self::CONTRACT_VERSION);
+    }
+
     /// Initializes the RewardManager with the XLM token contract address (SAC).
     /// Must be called once before any reward distribution.
+    /// @deprecated Use constructor during deployment instead.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -485,7 +516,7 @@ impl RewardManager {
             return Err(RewardErrorCode::Unauthorized);
         }
 
-        Err(RewardErrorCode::Unauthorized)
+        Ok(())
     }
 
     /// Adds a contract to the authorized callers list for `distribute_rewards`.
@@ -1319,17 +1350,11 @@ impl RewardManager {
             return Err(RewardErrorCode::Unauthorized);
         }
 
-        // Verify the hunt is in a terminal state (Cancelled or past end_time)
-        // Query HuntyCore for hunt status and end_time
-        let hunty_core_addr = Storage::get_hunty_core(&env);
-        if let Some(core_addr) = hunty_core_addr {
-            // Call hunty_core to check if hunt is terminal
-            let is_terminal: bool = env.invoke_contract(
-                &core_addr,
-                &Symbol::new(&env, "is_hunt_terminal"),
-                soroban_sdk::vec![&env, hunt_id.into_val(&env)],
-            );
-            if !is_terminal {
+        // Verify the hunt is in a terminal state (Cancelled or past end_time).
+        // HuntyCore exposes this as `is_hunt_terminal`; when HuntyCore is not
+        // configured the check is skipped and the creator is trusted.
+        if let Some(hunty_core) = Storage::get_hunty_core(&env) {
+            if !Self::is_hunt_terminal(&env, &hunty_core, hunt_id) {
                 return Err(RewardErrorCode::InvalidHuntStatus);
             }
         }
@@ -1436,6 +1461,7 @@ impl RewardManager {
     /// * The **destination pool must already exist** (created via
     ///   `create_reward_pool`).
     /// * **Both pools must have the same creator**, who must authorize the call.
+    /// * **Both pools must use the same token.**
     ///
     /// # Arguments
     /// * `creator` - The shared creator of both pools (must authorize the call)
@@ -1446,8 +1472,8 @@ impl RewardManager {
     /// The amount of XLM migrated from the source pool to the destination pool.
     ///
     /// # Errors
-    /// * `InvalidMigration` - source and destination are the same hunt, or the
-    ///   source pool has no balance to migrate
+    /// * `InvalidMigration` - source and destination are the same hunt, use
+    ///   different tokens, or the source pool has no balance to migrate
     /// * `PoolNotFound` - the source pool does not exist
     /// * `DestinationPoolNotFound` - the destination pool does not exist
     /// * `Unauthorized` - the caller does not own both pools
@@ -1479,6 +1505,13 @@ impl RewardManager {
             .ok_or(RewardErrorCode::DestinationPoolNotFound)?;
         if creator != dest_config.creator {
             return Err(RewardErrorCode::Unauthorized);
+        }
+
+        // Pool balances are denominated in their configured token. Moving a
+        // balance between pools with different tokens would credit an amount
+        // of one token against another token's balance.
+        if source_config.token_address != dest_config.token_address {
+            return Err(RewardErrorCode::InvalidMigration);
         }
 
         // Source hunt must be expired or cancelled (source of truth: HuntyCore).
@@ -1574,21 +1607,20 @@ impl RewardManager {
     /// the configured HuntyCore contract. When HuntyCore is not configured, or
     /// the cross-contract call fails, the source is treated as not eligible.
     fn source_hunt_is_migratable(env: &Env, hunt_id: u64) -> bool {
-        match Storage::get_hunty_core(env) {
-            Some(hunty_core) => {
-                let mut args: Vec<Val> = Vec::new(env);
-                args.push_back(hunt_id.into_val(env));
-                matches!(
-                    env.try_invoke_contract::<bool, RewardErrorCode>(
-                        &hunty_core,
-                        &Symbol::new(env, "is_hunt_expired_or_cancelled"),
-                        args,
-                    ),
-                    Ok(Ok(true))
-                )
-            }
-            None => false,
-        }
+        let hunty_core = match Storage::get_hunty_core(env) {
+            Some(c) => c,
+            None => return false,
+        };
+        let mut args: Vec<Val> = Vec::new(env);
+        args.push_back(hunt_id.into_val(env));
+        matches!(
+            env.try_invoke_contract::<bool, RewardErrorCode>(
+                &hunty_core,
+                &Symbol::new(env, "is_hunt_expired_or_cancelled"),
+                args,
+            ),
+            Ok(Ok(true))
+        )
     }
 
     /// Returns the full status of a reward pool, including balance, totals, and configuration.
@@ -3346,7 +3378,8 @@ impl RewardManager {
     /// * `Unauthorized` - Caller is not the contract admin
     /// * `PoolNotFound` - No pool exists for this hunt_id
     /// * `InvalidAmount` - Amount is <= 0, or exceeds the available pool balance
-    /// * `SourcePoolNotEligible` - Hunt is still active (not ended or cancelled)
+    /// * `InvalidHuntStatus` - Hunt has not reached a terminal status (only
+    ///   checked when HuntyCore is configured)
     pub fn admin_withdraw_unclaimed(
         env: Env,
         admin: Address,
@@ -3368,35 +3401,14 @@ impl RewardManager {
         // Ensure the pool exists
         Storage::get_pool_config(&env, hunt_id).ok_or(RewardErrorCode::PoolNotFound)?;
 
-        // Verify hunt has ended or been cancelled before allowing withdrawal
+        // Verify the hunt has reached a terminal HuntyCore status (Completed,
+        // Cancelled, EmergencyStopped, or Archived) before allowing a
+        // withdrawal (#1070). When HuntyCore is not configured there is
+        // nothing to check against, matching refund_pool's fail-open
+        // behavior in that case.
         if let Some(hunty_core) = Storage::get_hunty_core(&env) {
-            let mut args: Vec<Val> = Vec::new(&env);
-            args.push_back(hunt_id.into_val(&env));
-
-            // Try to get hunt info from HuntyCore
-            let hunt_result = env.try_invoke_contract::<Val, Val>(
-                &hunty_core,
-                &Symbol::new(&env, "get_hunt_info"),
-                args,
-            );
-
-            // If we can retrieve hunt info, verify it's not active
-            if let Ok(Ok(_hunt_data)) = hunt_result {
-                // Hunt exists; check its status via another call or accept that we have validation
-                // For now, we can check if current_time > end_time by getting the hunt status
-                // Since we can't easily deserialize the hunt struct in this context,
-                // we'll rely on the ledger timestamp vs end_time logic
-                // The hunt contract will handle detailed status validation
-
-                // As a fallback, we check that hunt status is not Active
-                // by attempting to call a helper that validates hunt ended
-                let _status_validation = env.try_invoke_contract::<Val, Val>(
-                    &hunty_core,
-                    &Symbol::new(&env, "is_hunt_active"),
-                    soroban_sdk::vec![&env, hunt_id.into_val(&env)],
-                );
-                // If the hunt is still active, we should reject this
-                // For now accept the withdrawal if hunt exists
+            if !Self::is_hunt_terminal(&env, &hunty_core, hunt_id) {
+                return Err(RewardErrorCode::InvalidHuntStatus);
             }
         }
 
@@ -3464,7 +3476,8 @@ impl RewardManager {
     /// * `Unauthorized` - Caller is not the contract admin
     /// * `PoolNotFound` - No pool exists for this hunt_id
     /// * `InvalidAmount` - Pool balance is zero (nothing to withdraw)
-    /// * `SourcePoolNotEligible` - Hunt is still active (not ended or cancelled)
+    /// * `InvalidHuntStatus` - Hunt has not reached a terminal status (only
+    ///   checked when HuntyCore is configured)
     pub fn admin_withdraw_all(
         env: Env,
         admin: Address,
@@ -3483,22 +3496,14 @@ impl RewardManager {
         // Ensure the pool exists
         Storage::get_pool_config(&env, hunt_id).ok_or(RewardErrorCode::PoolNotFound)?;
 
-        // Verify hunt has ended or been cancelled before allowing withdrawal
+        // Verify the hunt has reached a terminal HuntyCore status (Completed,
+        // Cancelled, EmergencyStopped, or Archived) before allowing a
+        // withdrawal (#1070). When HuntyCore is not configured there is
+        // nothing to check against, matching refund_pool's fail-open
+        // behavior in that case.
         if let Some(hunty_core) = Storage::get_hunty_core(&env) {
-            let mut args: Vec<Val> = Vec::new(&env);
-            args.push_back(hunt_id.into_val(&env));
-
-            // Try to get hunt info from HuntyCore
-            let hunt_result = env.try_invoke_contract::<Val, Val>(
-                &hunty_core,
-                &Symbol::new(&env, "get_hunt_info"),
-                args,
-            );
-
-            // If we can retrieve hunt info, verify it's not active
-            if let Ok(Ok(_hunt_data)) = hunt_result {
-                // Hunt exists; we accept the withdrawal
-                // Detailed status checking would require deserialization
+            if !Self::is_hunt_terminal(&env, &hunty_core, hunt_id) {
+                return Err(RewardErrorCode::InvalidHuntStatus);
             }
         }
 
