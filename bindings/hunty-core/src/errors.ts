@@ -50,7 +50,7 @@ export const HuntErrorCode = {
   49: {message:"InvalidPoints"},
   50: {message:"HuntFull"},
   51: {message:"LeaderboardVisibilityUnauthorized"},
-  52: {message:"InvalidHint"}
+  52: {message:"PrivateHuntRequiresInvite"}
 }
 
 

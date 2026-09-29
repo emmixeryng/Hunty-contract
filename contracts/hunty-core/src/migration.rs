@@ -1,4 +1,4 @@
-use crate::storage::Storage;
+use crate::storage::{Storage, MAX_CO_CREATORS};
 use hunty_migration::{
     MigrationFramework, UpgradeAuthError, UpgradeAuthorization, UpgradeExecutedEvent,
     UpgradeHistoryEntry, UpgradeProposal, UpgradeProposedEvent,
@@ -297,6 +297,22 @@ impl HuntyCoreMigration {
                 let clue = all_clues.get(i).unwrap();
                 Storage::save_clue(env, hunt_id, &clue);
             }
+        }
+    }
+
+    /// v4 -> v5: move co-creator lists from instance storage to persistent
+    /// storage and enforce the per-hunt cap.
+    fn migrate_v4_to_v5(env: &Env) {
+        let hunt_count = Storage::get_hunt_counter(env);
+        for hunt_id in 1..=hunt_count {
+            if Storage::get_hunt(env, hunt_id).is_none() {
+                continue;
+            }
+            let mut co_creators = Storage::get_co_creators(env, hunt_id);
+            if co_creators.len() > MAX_CO_CREATORS {
+                co_creators = co_creators.slice(0..MAX_CO_CREATORS);
+            }
+            Storage::set_co_creators(env, hunt_id, &co_creators);
         }
     }
 }

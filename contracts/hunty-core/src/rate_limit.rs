@@ -12,7 +12,7 @@ const RATE_LIMIT_TTL: u32 = 30 * 24 * 60 * 60;
 const RATE_LIMIT_TTL_THRESHOLD: u32 = 15 * 24 * 60 * 60;
 
 /// Namespace used to avoid collisions with other features keying by a bare `Address`.
-const RATE_LIMIT_NAMESPACE: &str = "HRATE";
+pub const RATE_LIMIT_NAMESPACE: &str = "HRATE";
 
 /// Legacy namespace used before the fix, for migration of existing entries.
 const RATE_LIMIT_LEGACY_NAMESPACE: &str = "HRATE_LEGACY";
